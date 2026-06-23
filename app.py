@@ -3,7 +3,19 @@ import pickle
 import requests
 import os
 from dotenv import load_dotenv
+import numpy as np
+import streamlit as st
+import pickle
+import requests
+import os
 
+import re
+
+POSTER_DIR = "posters"
+
+# create folder if not exists
+if not os.path.exists(POSTER_DIR):
+    os.makedirs(POSTER_DIR)
 load_dotenv()
 
 # -----------------------------
@@ -17,8 +29,11 @@ API_KEY = os.getenv("TMDB_API_KEY")
 # LOAD DATA
 # -----------------------------
 movies = pickle.load(open('movies.pkl', 'rb'))
-similarity = pickle.load(open('similarity.pkl', 'rb'))
+movies['genres_str'] = movies['genres'].apply(
+    lambda x: " ".join(x) if isinstance(x, list) else str(x)
+)
 
+embeddings = pickle.load(open('embeddings.pkl', 'rb'))
 movies['title_lower'] = movies['title'].str.lower()
 
 # -----------------------------
@@ -40,6 +55,15 @@ if "home_movies" not in st.session_state:
 @st.cache_data(show_spinner=False)
 def fetch_poster(movie_name):
     try:
+        # ✅ safe filename
+        filename = re.sub(r'[^a-zA-Z0-9]', '_', movie_name.lower()) + ".jpg"
+        filepath = os.path.join(POSTER_DIR, filename)
+
+        # ✅ 1. check if already saved
+        if os.path.exists(filepath):
+            return filepath
+
+        # ✅ 2. fetch from TMDB
         url = "https://api.themoviedb.org/3/search/movie"
 
         params = {
@@ -48,22 +72,37 @@ def fetch_poster(movie_name):
         }
 
         response = requests.get(url, params=params, timeout=5).json()
-
         results = response.get("results", [])
 
         if not results:
             return None
 
-        poster_path = results[0].get("poster_path")
+        # ✅ exact match first
+        poster_path = None
+        for movie in results:
+            if movie['title'].lower() == movie_name.lower():
+                poster_path = movie.get("poster_path")
+                break
 
-        if poster_path:
-            return f"https://image.tmdb.org/t/p/w500{poster_path}"
+        # fallback
+        if not poster_path:
+            poster_path = results[0].get("poster_path")
 
-        return None
+        if not poster_path:
+            return None
+
+        image_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+
+        # ✅ 3. download image
+        img_data = requests.get(image_url, timeout=5).content
+
+        with open(filepath, "wb") as f:
+            f.write(img_data)
+
+        return filepath
 
     except:
         return None
-
 
 # -----------------------------
 # RECOMMENDATION FUNCTION (CACHED)
@@ -76,16 +115,35 @@ def recommend(movie):
         return []
 
     index = movies[movies['title_lower'] == movie].index[0]
-    distances = similarity[index]
 
-    movie_list = sorted(
-        list(enumerate(distances)),
-        reverse=True,
-        key=lambda x: x[1]
+    # Compute cosine similarity using embeddings
+    scores = np.dot(embeddings, embeddings[index]) / (
+        np.linalg.norm(embeddings, axis=1) * np.linalg.norm(embeddings[index])
+    )
+
+    similar_movies = sorted(
+        list(enumerate(scores)),
+        key=lambda x: x[1],
+        reverse=True
     )[1:11]
 
-    return [(movies.iloc[i[0]].title, i[1]) for i in movie_list]
+    return [(movies.iloc[i[0]].title, i[1]) for i in similar_movies]
 
+
+def explain_recommendation(selected_movie, recommended_movie):
+    
+    selected = movies[movies['title'] == selected_movie].iloc[0]
+    recommended = movies[movies['title'] == recommended_movie].iloc[0]
+
+    selected_genres = set(selected['genres_str'].lower().split())
+    recommended_genres = set(recommended['genres_str'].lower().split())
+
+    common_genres = selected_genres.intersection(recommended_genres)
+
+    if common_genres:
+        return f"Shared genres: {', '.join(list(common_genres)[:3])}"
+    
+    return "Similar overall theme"
 
 # -----------------------------
 # HEADER
@@ -189,10 +247,15 @@ elif st.session_state.page == "details":
 
                 with cols[i % 5]:
                     st.text(name)
-                    st.caption(f"Similarity: {round(score, 2)}")
-                    poster = fetch_poster(name)
+                    st.caption(f"Match: {int(score * 100)}%")
 
-                    if poster:
-                        st.image(poster, use_container_width=True)
+                    # 🔥 ADD THIS LINE
+                    reason = explain_recommendation(movie, name)
+                    st.caption(reason)
+
+                    rec_poster = fetch_poster(name)
+
+                    if rec_poster:
+                        st.image(rec_poster, use_container_width=True)
                     else:
                         st.image("https://via.placeholder.com/200x300?text=No+Image")
