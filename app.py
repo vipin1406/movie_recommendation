@@ -2,39 +2,77 @@ import streamlit as st
 import pickle
 import requests
 import os
-from dotenv import load_dotenv
 import numpy as np
-import streamlit as st
-import pickle
-import requests
-import os
-
 import re
-
-POSTER_DIR = "posters"
-
-# create folder if not exists
-if not os.path.exists(POSTER_DIR):
-    os.makedirs(POSTER_DIR)
-load_dotenv()
+import ast
+from dotenv import load_dotenv
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 st.set_page_config(layout="wide", page_title="Movie Recommender")
+load_dotenv()
 
 API_KEY = os.getenv("TMDB_API_KEY")
+
+POSTER_DIR = "posters"
+os.makedirs(POSTER_DIR, exist_ok=True)
 
 # -----------------------------
 # LOAD DATA
 # -----------------------------
 movies = pickle.load(open('movies.pkl', 'rb'))
-movies['genres_str'] = movies['genres'].apply(
-    lambda x: " ".join(x) if isinstance(x, list) else str(x)
-)
 
-embeddings = pickle.load(open('embeddings.pkl', 'rb'))
 movies['title_lower'] = movies['title'].str.lower()
+movies['cast'] = movies['cast'].apply(lambda x: x if isinstance(x, list) else [])
+
+# -----------------------------
+# DIRECTOR FROM CREW
+# -----------------------------
+def get_director(obj):
+    try:
+        if isinstance(obj, list):
+            for i in obj:
+                if i.get("job") == "Director":
+                    return [i.get("name")]
+        return []
+    except:
+        return []
+
+movies['director'] = movies['crew'].apply(get_director)
+
+# -----------------------------
+# GENRES CLEANING
+# -----------------------------
+def convert(obj):
+    try:
+        return ast.literal_eval(obj)
+    except:
+        return []
+
+def get_names(obj):
+    return [i['name'] for i in obj if isinstance(i, dict) and 'name' in i]
+
+movies['genres'] = movies['genres'].apply(convert)
+movies['genres'] = movies['genres'].apply(get_names)
+movies['genres_str'] = movies['genres'].apply(lambda x: " ".join(x))
+
+# -----------------------------
+# NORMALIZATION
+# -----------------------------
+movies['vote_average_norm'] = movies['vote_average'] / 10
+movies['vote_count_norm'] = movies['vote_count'] / movies['vote_count'].max()
+movies['popularity_norm'] = movies['popularity'] / movies['popularity'].max()
+
+# -----------------------------
+# LOOKUP MAP
+# -----------------------------
+movie_index = {title: i for i, title in enumerate(movies['title_lower'])}
+
+# -----------------------------
+# EMBEDDINGS
+# -----------------------------
+embeddings = pickle.load(open('embeddings.pkl', 'rb'))
 
 # -----------------------------
 # SESSION STATE
@@ -48,28 +86,20 @@ if "selected_movie" not in st.session_state:
 if "home_movies" not in st.session_state:
     st.session_state.home_movies = movies.sample(10).reset_index(drop=True)
 
-
 # -----------------------------
-# POSTER FUNCTION (CACHED)
+# POSTER FUNCTION
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def fetch_poster(movie_name):
     try:
-        # ✅ safe filename
         filename = re.sub(r'[^a-zA-Z0-9]', '_', movie_name.lower()) + ".jpg"
         filepath = os.path.join(POSTER_DIR, filename)
 
-        # ✅ 1. check if already saved
         if os.path.exists(filepath):
             return filepath
 
-        # ✅ 2. fetch from TMDB
         url = "https://api.themoviedb.org/3/search/movie"
-
-        params = {
-            "api_key": API_KEY,
-            "query": movie_name
-        }
+        params = {"api_key": API_KEY, "query": movie_name}
 
         response = requests.get(url, params=params, timeout=5).json()
         results = response.get("results", [])
@@ -77,23 +107,11 @@ def fetch_poster(movie_name):
         if not results:
             return None
 
-        # ✅ exact match first
-        poster_path = None
-        for movie in results:
-            if movie['title'].lower() == movie_name.lower():
-                poster_path = movie.get("poster_path")
-                break
-
-        # fallback
-        if not poster_path:
-            poster_path = results[0].get("poster_path")
-
+        poster_path = results[0].get("poster_path")
         if not poster_path:
             return None
 
         image_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
-
-        # ✅ 3. download image
         img_data = requests.get(image_url, timeout=5).content
 
         with open(filepath, "wb") as f:
@@ -105,33 +123,49 @@ def fetch_poster(movie_name):
         return None
 
 # -----------------------------
-# RECOMMENDATION FUNCTION (CACHED)
+# RECOMMENDATION ENGINE
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def recommend(movie):
     movie = movie.lower()
 
-    if movie not in movies['title_lower'].values:
+    if movie not in movie_index:
         return []
 
-    index = movies[movies['title_lower'] == movie].index[0]
+    index = movie_index[movie]
 
-    # Compute cosine similarity using embeddings
-    scores = np.dot(embeddings, embeddings[index]) / (
-        np.linalg.norm(embeddings, axis=1) * np.linalg.norm(embeddings[index])
-    )
+    norms = np.linalg.norm(embeddings, axis=1)
+    target_norm = np.linalg.norm(embeddings[index])
 
-    similar_movies = sorted(
-        list(enumerate(scores)),
-        key=lambda x: x[1],
-        reverse=True
-    )[1:11]
+    scores = np.dot(embeddings, embeddings[index]) / (norms * target_norm + 1e-10)
 
-    return [(movies.iloc[i[0]].title, i[1]) for i in similar_movies]
+    results = []
+    selected_genres = set(movies.iloc[index]['genres'])
 
+    for i, sim_score in enumerate(scores):
 
+        if i == index:
+            continue    
+
+        if sim_score < 0.5:
+            continue
+
+        rec_genres = set(movies.iloc[i]['genres'])
+
+        genre_match = len(selected_genres.intersection(rec_genres))
+
+        final_score = sim_score + (0.1 * genre_match)
+        results.append((i, final_score, sim_score))
+
+    results = sorted(results, key=lambda x: x[1], reverse=True)[:10]
+
+    return [(movies.iloc[i[0]].title, i[2]) for i in results]
+
+# -----------------------------
+# EXPLAINABILITY
+# -----------------------------
 def explain_recommendation(selected_movie, recommended_movie):
-    
+
     selected = movies[movies['title'] == selected_movie].iloc[0]
     recommended = movies[movies['title'] == recommended_movie].iloc[0]
 
@@ -140,40 +174,59 @@ def explain_recommendation(selected_movie, recommended_movie):
 
     common_genres = selected_genres.intersection(recommended_genres)
 
+    selected_cast = set(selected.get('cast', []))
+    recommended_cast = set(recommended.get('cast', []))
+    common_cast = selected_cast.intersection(recommended_cast)
+
+    selected_director = set(selected.get('director', []))
+    recommended_director = set(recommended.get('director', []))
+    common_director = selected_director.intersection(recommended_director)
+
+    if common_director:
+        return f"Same director: {list(common_director)[0]}"
+
+    if common_cast:
+        return f"Shared cast: {', '.join(list(common_cast)[:2])}"
+
     if common_genres:
         return f"Shared genres: {', '.join(list(common_genres)[:3])}"
-    
-    return "Similar overall theme"
+
+    return "Similar storyline/theme"
 
 # -----------------------------
-# HEADER
+# UI
 # -----------------------------
 st.title("🎬 Movie Recommendation System")
 
-
-# -----------------------------
 # BACK BUTTON
-# -----------------------------
 if st.session_state.page == "details":
-    if st.button("⬅️ Back to Home"):
+    if st.button("⬅️ Back"):
         st.session_state.page = "home"
         st.session_state.selected_movie = None
         st.rerun()
-
 
 # -----------------------------
 # HOME PAGE
 # -----------------------------
 if st.session_state.page == "home":
 
+    search_query = st.text_input("🔍 Search movies...")
+
     st.subheader("🔥 Trending Movies")
 
     movie_list = st.session_state.home_movies
-    movies_per_row = 5
 
-    for i in range(0, len(movie_list), movies_per_row):
+    if search_query:
+        movie_list = movies[movies['title'].str.lower().str.contains(search_query.lower())]
 
-        row = movie_list.iloc[i:i + movies_per_row]
+        if movie_list.empty:
+            st.warning("⚠️ No movies found")
+
+    cols_per_row = 5
+
+    for i in range(0, len(movie_list), cols_per_row):
+
+        row = movie_list.iloc[i:i + cols_per_row]
         cols = st.columns(len(row))
 
         for j in range(len(row)):
@@ -183,18 +236,15 @@ if st.session_state.page == "home":
                 title = row.iloc[j]['title']
                 poster = fetch_poster(title)
 
-                if poster:
-                    st.image(poster, use_container_width=True)
-                else:
-                    st.image("https://via.placeholder.com/200x300?text=No+Image")
+                st.image(
+                    poster if poster else "https://via.placeholder.com/200x300",
+                    width=200
+                )
 
-                # ✅ FIXED: stable key using movie title
-                if st.button(title, key=title):
-
+                if st.button(title, key=f"home_{title}"):
                     st.session_state.selected_movie = title
                     st.session_state.page = "details"
                     st.rerun()
-
 
 # -----------------------------
 # DETAILS PAGE
@@ -203,59 +253,50 @@ elif st.session_state.page == "details":
 
     movie = st.session_state.selected_movie
 
-    if movie:
+    st.subheader("🎯 Selected Movie")
 
-        st.markdown("---")
-        st.subheader("🎯 Selected Movie")
+    col1, col2, col3 = st.columns([1, 2, 1])
 
-        col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        poster = fetch_poster(movie)
+        st.image(
+            poster if poster else "https://via.placeholder.com/300x450",
+            width=300
+        )
 
-        with col2:
+    st.markdown("---")
+    st.markdown(f"## 🎬 {movie}")
 
-            poster = fetch_poster(movie)
+    rec_movie = movies[movies['title'] == movie].iloc[0]
 
-            if poster:
-                st.image(poster, width=300)
-            else:
-                st.image("https://via.placeholder.com/300x450?text=No+Image")
+    st.caption(f"⭐ Rating: {rec_movie['vote_average']}")
 
-            st.markdown(f"### {movie}")
+    # -----------------------------
+    # RECOMMENDATIONS
+    # -----------------------------
+    st.subheader("🍿 Recommended Movies")
 
-        # -----------------------------
-        # RECOMMENDATIONS
-        # -----------------------------
-        st.subheader("🍿 Recommended Movies")
-        st.markdown("### 🤔 Why these recommendations?")
+    names = recommend(movie)
 
-        st.info("""
-        These movies are recommended based on similarity in:
-        - Genre
-        - Keywords
-        - Movie overview
+    # 🔥 HANDLE EMPTY CASE
+    if not names:
+        st.warning("⚠️ No similar movies found")
+    else:
+        cols = st.columns(5)
 
-        We use cosine similarity on movie feature vectors.
-        """)
+        for i, (name, score) in enumerate(names):
 
-        names = recommend(movie)
+            with cols[i % 5]:
 
-        if not names:
-            st.warning("No recommendations found.")
-        else:
-            cols = st.columns(5)
+                poster = fetch_poster(name)
+                st.image(
+                    poster if poster else "https://via.placeholder.com/200x300",
+                    width=200
+                )
 
-            for i, (name, score) in enumerate(names):
+                if st.button(name, key=f"rec_{name}_{i}"):
+                    st.session_state.selected_movie = name
+                    st.rerun()
 
-                with cols[i % 5]:
-                    st.text(name)
-                    st.caption(f"Match: {int(score * 100)}%")
-
-                    # 🔥 ADD THIS LINE
-                    reason = explain_recommendation(movie, name)
-                    st.caption(reason)
-
-                    rec_poster = fetch_poster(name)
-
-                    if rec_poster:
-                        st.image(rec_poster, use_container_width=True)
-                    else:
-                        st.image("https://via.placeholder.com/200x300?text=No+Image")
+                st.caption(f"Match: {int(score*100)}%")
+                st.success(explain_recommendation(movie, name))
